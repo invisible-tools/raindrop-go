@@ -67,7 +67,7 @@ if err := interaction.Finish(ctx, raindrop.FinishParams{
 }
 ```
 
-Raindrop shows the interaction as soon as `Begin` is called and updates it every time you set properties or attachments, so teams can watch the workflow play out in real time.
+Call `Begin` to create the interaction, enrich it with properties and attachments as you go, and call `Finish` once you have the final output.
 
 ### 3. Gather human feedback & signals
 
