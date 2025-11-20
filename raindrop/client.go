@@ -176,7 +176,7 @@ func (c *Client) Begin(ctx context.Context, params BeginParams) (*Interaction, e
 		IsPending:   boolPtr(true),
 	}
 
-	interaction := newInteraction(c, state, c.cfg.PartialFlushInterval)
+	interaction := newInteraction(ctx, c, state, c.cfg.PartialFlushInterval)
 
 	c.partialMu.Lock()
 	c.partials[eventID] = interaction

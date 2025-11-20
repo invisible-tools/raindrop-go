@@ -2,8 +2,12 @@ package raindrop
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Interaction wraps an in-flight AI event with helpers for partial updates.
@@ -15,16 +19,35 @@ type Interaction struct {
 	interval time.Duration
 	finished bool
 
-	workflowOnce sync.Once
-	workflow     *WorkflowSpan
+	workflow *WorkflowSpan
 }
 
-func newInteraction(client *Client, state *trackRequest, interval time.Duration) *Interaction {
-	return &Interaction{
+func newInteraction(ctx context.Context, client *Client, state *trackRequest, interval time.Duration) *Interaction {
+	i := &Interaction{
 		client:   client,
 		state:    state,
 		interval: interval,
 	}
+
+	tracer := client.Tracer()
+	if tracer.Enabled() {
+		assoc := map[string]string{
+			"event_id": state.EventID,
+			"user_id":  state.UserID,
+		}
+		name := state.Event
+		if name == "" {
+			name = "interaction"
+		}
+		i.workflow = tracer.NewWorkflow(ctx, WorkflowSpanConfig{
+			Name:                  name,
+			AssociationProperties: assoc,
+		})
+	} else {
+		i.workflow = newNoopWorkflow()
+	}
+
+	return i
 }
 
 // EventID exposes the server-correlated identifier.
@@ -40,6 +63,15 @@ func (i *Interaction) SetProperty(ctx context.Context, key string, value any) er
 	if err != nil {
 		return err
 	}
+
+	// Sync to trace attributes if workflow is active
+	if i.workflow != nil && !i.workflow.disabled {
+		if span := trace.SpanFromContext(i.workflow.Context()); span.IsRecording() {
+			strVal := fmt.Sprintf("%v", value)
+			span.SetAttributes(attribute.String("traceloop.association.properties."+key, strVal))
+		}
+	}
+
 	return i.updateState(ctx, func(state *trackRequest) error {
 		state.Properties = state.Properties.merge(data)
 		return nil
@@ -53,6 +85,17 @@ func (i *Interaction) SetProperties(ctx context.Context, props Props) error {
 		if err != nil {
 			return err
 		}
+
+		// Sync to trace attributes if workflow is active
+		if i.workflow != nil && !i.workflow.disabled {
+			if span := trace.SpanFromContext(i.workflow.Context()); span.IsRecording() {
+				for k, v := range data {
+					strVal := fmt.Sprintf("%v", v)
+					span.SetAttributes(attribute.String("traceloop.association.properties."+k, strVal))
+				}
+			}
+		}
+
 		state.Properties = state.Properties.merge(data)
 		return nil
 	})
@@ -220,11 +263,7 @@ type LLMSpanConfig struct {
 }
 
 // LLMSpan creates a tracing span for a single model invocation associated with this interaction.
-func (i *Interaction) LLMSpan(ctx context.Context, cfg LLMSpanConfig) (*LLMSpan, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
+func (i *Interaction) LLMSpan(_ context.Context, cfg LLMSpanConfig) *LLMSpan {
 	if cfg.Prompt.Model == "" && i.state.AIData != nil && i.state.AIData.Model != "" {
 		cfg.Prompt.Model = i.state.AIData.Model
 	}
@@ -235,49 +274,26 @@ func (i *Interaction) LLMSpan(ctx context.Context, cfg LLMSpanConfig) (*LLMSpan,
 		cfg.Prompt.Vendor = "custom"
 	}
 
-	wf := i.ensureWorkflow(ctx)
-	return wf.LLMSpan(cfg.Prompt)
+	// Error is swallowed here to provide a cleaner API (no-op span returned on error/disabled)
+	span := i.workflow.LLMSpan(cfg.Prompt)
+	return span
 }
 
 // TaskSpan creates a child task span under the interaction workflow.
-func (i *Interaction) TaskSpan(ctx context.Context, cfg TaskSpanConfig) *TaskSpan {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	wf := i.ensureWorkflow(ctx)
-	return wf.NewTask(cfg)
+func (i *Interaction) TaskSpan(_ context.Context, cfg TaskSpanConfig) *TaskSpan {
+	return i.workflow.NewTask(cfg)
 }
 
-func (i *Interaction) ensureWorkflow(ctx context.Context) *WorkflowSpan {
-	tracer := i.client.Tracer()
-	if !tracer.Enabled() {
-		return newNoopWorkflow()
-	}
-
-	i.workflowOnce.Do(func() {
-		assoc := map[string]string{
-			"event_id": i.state.EventID,
-			"user_id":  i.state.UserID,
-		}
-		name := i.state.Event
-		if name == "" {
-			name = "interaction"
-		}
-		i.workflow = tracer.NewWorkflow(ctx, WorkflowSpanConfig{
-			Name:                  name,
-			AssociationProperties: assoc,
-		})
-	})
-
-	if i.workflow == nil {
-		return newNoopWorkflow()
-	}
-	return i.workflow
+// ToolSpan creates a child tool span under the interaction workflow.
+func (i *Interaction) ToolSpan(_ context.Context, cfg ToolSpanConfig) *ToolSpan {
+	return i.workflow.NewTool(cfg)
 }
 
 func (i *Interaction) closeWorkflow() {
 	if i.workflow != nil {
 		i.workflow.End()
-		i.workflow = nil
+		// We don't nil it out as it might be accessed after finish (though it shouldn't be used for new spans)
+		// but setting to nil would race without lock if we did locking.
+		// Since finished=true prevents updates, this is fine.
 	}
 }

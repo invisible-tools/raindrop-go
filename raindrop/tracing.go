@@ -2,19 +2,27 @@ package raindrop
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/url"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
+	"unsafe"
 
+	semconvai "github.com/traceloop/go-openllmetry/semconv-ai"
 	traceloop "github.com/traceloop/go-openllmetry/traceloop-sdk"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type (
-	Prompt     = traceloop.Prompt
-	Message    = traceloop.Message
-	Completion = traceloop.Completion
-	Usage      = traceloop.Usage
+	Prompt       = traceloop.Prompt
+	Message      = traceloop.Message
+	Completion   = traceloop.Completion
+	Usage        = traceloop.Usage
+	ToolFunction = traceloop.ToolFunction
 )
 
 // Tracer wraps the Traceloop Go SDK, providing ergonomic helpers while keeping
@@ -76,27 +84,34 @@ func (t *Tracer) NewWorkflow(ctx context.Context, cfg WorkflowSpanConfig) *Workf
 		AssociationProperties: mergeAssoc(t.associationProps, cfg.AssociationProperties),
 	}
 	wf := t.client.NewWorkflow(ctx, attrs)
+
+	// Extract the context from the workflow to ensure children span from it
+	wfCtx := extractWorkflowContext(wf)
+	if wfCtx == nil {
+		wfCtx = ctx
+	}
+
 	return &WorkflowSpan{
 		tracer:   t,
 		workflow: wf,
-		ctx:      ctx,
+		ctx:      wfCtx,
 	}
 }
 
 // LogPrompt creates a standalone LLM span without requiring a workflow span.
-func (t *Tracer) LogPrompt(ctx context.Context, prompt Prompt, cfg WorkflowSpanConfig) (*LLMSpan, error) {
+func (t *Tracer) LogPrompt(ctx context.Context, prompt Prompt, cfg WorkflowSpanConfig) *LLMSpan {
 	if t == nil || !t.Enabled() || strings.TrimSpace(cfg.Name) == "" {
-		return newNoopLLMSpan(ctx), nil
+		return newNoopLLMSpan(ctx)
 	}
-	attrs := traceloop.WorkflowAttributes{
-		Name:                  cfg.Name,
+	// We need to adapt to v0.1.3 changes.
+	ctxAttrs := traceloop.ContextAttributes{
+		WorkflowName:          &cfg.Name,
 		AssociationProperties: mergeAssoc(t.associationProps, cfg.AssociationProperties),
 	}
-	span, err := t.client.LogPrompt(ctx, prompt, attrs)
-	if err != nil {
-		return nil, err
-	}
-	return newLLMSpan(span, ctx), nil
+
+	span := t.client.LogPrompt(ctx, prompt, ctxAttrs)
+	// LogPrompt now returns LLMSpan value, not pointer and error.
+	return newLLMSpan(span, ctx)
 }
 
 type WorkflowSpanConfig struct {
@@ -106,6 +121,13 @@ type WorkflowSpanConfig struct {
 
 type TaskSpanConfig struct {
 	Name string
+}
+
+type ToolSpanConfig struct {
+	Name                  string
+	Type                  string
+	Function              ToolFunction
+	AssociationProperties map[string]string
 }
 
 type WorkflowSpan struct {
@@ -133,15 +155,12 @@ func (w *WorkflowSpan) Context() context.Context {
 	return w.ctx
 }
 
-func (w *WorkflowSpan) LLMSpan(prompt Prompt) (*LLMSpan, error) {
+func (w *WorkflowSpan) LLMSpan(prompt Prompt) *LLMSpan {
 	if w == nil || w.disabled || w.workflow == nil {
-		return newNoopLLMSpan(w.Context()), nil
+		return newNoopLLMSpan(w.Context())
 	}
-	span, err := w.workflow.LogPrompt(prompt)
-	if err != nil {
-		return nil, err
-	}
-	return newLLMSpan(span, w.Context()), nil
+	span := w.workflow.LogPrompt(prompt)
+	return newLLMSpan(span, w.Context())
 }
 
 func (w *WorkflowSpan) NewTask(cfg TaskSpanConfig) *TaskSpan {
@@ -150,9 +169,64 @@ func (w *WorkflowSpan) NewTask(cfg TaskSpanConfig) *TaskSpan {
 	}
 
 	task := w.workflow.NewTask(cfg.Name)
+
+	// Extract the context from the task
+	taskCtx := extractTaskContext(task)
+	if taskCtx == nil {
+		// Fallback to parent context if extraction fails, though this means trace will be broken
+		// but we should try to maintain at least something.
+		taskCtx = w.Context()
+	}
+
 	return &TaskSpan{
 		task: task,
-		ctx:  w.Context(),
+		ctx:  taskCtx,
+	}
+}
+
+// NewTool creates a tool span manually using the underlying tracer, avoiding the need for an Agent.
+func (w *WorkflowSpan) NewTool(cfg ToolSpanConfig) *ToolSpan {
+	if w == nil || w.disabled || w.workflow == nil || strings.TrimSpace(cfg.Name) == "" {
+		return newNoopTool()
+	}
+
+	tracer := extractTracer(w.tracer.client)
+	if tracer == nil {
+		return newNoopTool()
+	}
+
+	toolCtx, span := tracer.Start(w.ctx, fmt.Sprintf("%s.tool", cfg.Name))
+
+	attrs := []attribute.KeyValue{
+		semconvai.TraceloopWorkflowName.String(w.workflow.Attributes.Name),
+		semconvai.TraceloopSpanKind.String(string(semconvai.SpanKindTool)),
+		semconvai.TraceloopEntityName.String(cfg.Name),
+	}
+
+	// Add tool parameters if present
+	if cfg.Function.Parameters != nil {
+		if paramsJSON, err := json.Marshal(cfg.Function.Parameters); err == nil {
+			attrs = append(attrs, attribute.String("traceloop.entity.input", string(paramsJSON)))
+		}
+	}
+
+	// Add workflow association properties
+	for k, v := range w.workflow.Attributes.AssociationProperties {
+		attrs = append(attrs, attribute.String("traceloop.association.properties."+k, v))
+	}
+
+	// Add tool association properties
+	for k, v := range cfg.AssociationProperties {
+		attrs = append(attrs, attribute.String("traceloop.association.properties."+k, v))
+	}
+
+	span.SetAttributes(attrs...)
+
+	return &ToolSpan{
+		tracer:     w.tracer,
+		workflow:   w,
+		ctx:        toolCtx,
+		properties: cfg.AssociationProperties,
 	}
 }
 
@@ -180,15 +254,80 @@ func (t *TaskSpan) Context() context.Context {
 	return t.ctx
 }
 
-func (t *TaskSpan) LLMSpan(prompt Prompt) (*LLMSpan, error) {
+func (t *TaskSpan) LLMSpan(prompt Prompt) *LLMSpan {
 	if t == nil || t.disabled || t.task == nil {
-		return newNoopLLMSpan(t.Context()), nil
+		return newNoopLLMSpan(t.Context())
 	}
-	span, err := t.task.LogPrompt(prompt)
-	if err != nil {
-		return nil, err
+	span := t.task.LogPrompt(prompt)
+	return newLLMSpan(span, t.Context())
+}
+
+type ToolSpan struct {
+	tracer     *Tracer
+	workflow   *WorkflowSpan
+	ctx        context.Context
+	properties map[string]string
+	disabled   bool
+}
+
+func newNoopTool() *ToolSpan {
+	return &ToolSpan{disabled: true}
+}
+
+func (t *ToolSpan) End() {
+	if t == nil || t.disabled || t.ctx == nil {
+		return
 	}
-	return newLLMSpan(span, t.Context()), nil
+	trace.SpanFromContext(t.ctx).End()
+}
+
+// ReportResult logs the output of the tool execution.
+func (t *ToolSpan) ReportResult(result string) {
+	if t == nil || t.disabled || t.ctx == nil {
+		return
+	}
+	span := trace.SpanFromContext(t.ctx)
+	if span.IsRecording() {
+		span.SetAttributes(attribute.String("traceloop.entity.output", result))
+	}
+}
+
+func (t *ToolSpan) Context() context.Context {
+	if t == nil || t.ctx == nil {
+		return context.Background()
+	}
+	return t.ctx
+}
+
+func (t *ToolSpan) LLMSpan(prompt Prompt) *LLMSpan {
+	if t == nil || t.disabled || t.tracer == nil || t.tracer.client == nil {
+		return newNoopLLMSpan(t.Context())
+	}
+
+	// Manually call LogPrompt on the SDK client
+	// Merge properties: Workflow + Tool
+	assoc := make(map[string]string)
+	if t.workflow != nil {
+		for k, v := range t.workflow.workflow.Attributes.AssociationProperties {
+			assoc[k] = v
+		}
+	}
+	for k, v := range t.properties {
+		assoc[k] = v
+	}
+
+	wfName := ""
+	if t.workflow != nil {
+		wfName = t.workflow.workflow.Attributes.Name
+	}
+
+	ctxAttrs := traceloop.ContextAttributes{
+		WorkflowName:          &wfName,
+		AssociationProperties: assoc,
+	}
+
+	span := t.tracer.client.LogPrompt(t.ctx, prompt, ctxAttrs)
+	return newLLMSpan(span, t.ctx)
 }
 
 type LLMSpan struct {
@@ -232,14 +371,12 @@ func (l *LLMSpan) RecordCompletion(ctx context.Context, completion Completion, u
 	if ctx == nil {
 		ctx = l.Context()
 	}
-	var err error
 	l.once.Do(func() {
-		err = l.span.LogCompletion(ctx, completion, usage)
+		l.span.LogCompletion(ctx, completion, usage)
 	})
-	return err
+	return nil
 }
 
-// End closes the span even if no completion data was recorded.
 func (l *LLMSpan) End(ctx context.Context) error {
 	return l.RecordCompletion(ctx, Completion{}, Usage{})
 }
@@ -286,4 +423,80 @@ func deriveTracingBase(ingest string) string {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String()
+}
+
+// extractTracer uses reflection to get the tracerProvider and then a tracer
+func extractTracer(tl *traceloop.Traceloop) trace.Tracer {
+	if tl == nil {
+		return nil
+	}
+	defer func() {
+		_ = recover()
+	}()
+
+	val := reflect.ValueOf(tl).Elem()
+
+	// Field: tracerProvider *trace.TracerProvider
+	tpField := val.FieldByName("tracerProvider")
+	if !tpField.IsValid() || tpField.IsNil() {
+		return nil
+	}
+
+	// Unsafe access to pointer
+	realTPField := reflect.NewAt(tpField.Type(), unsafe.Pointer(tpField.UnsafeAddr())).Elem()
+	tp, ok := realTPField.Interface().(trace.TracerProvider)
+	if !ok || tp == nil {
+		return nil
+	}
+
+	// Field: config Config (to get TracerName)
+	configField := val.FieldByName("config")
+	tracerName := "traceloop.tracer"
+	if configField.IsValid() {
+		realConfigField := reflect.NewAt(configField.Type(), unsafe.Pointer(configField.UnsafeAddr())).Elem()
+		cfg := realConfigField.Interface().(traceloop.Config)
+		if cfg.TracerName != "" {
+			tracerName = cfg.TracerName
+		}
+	}
+
+	return tp.Tracer(tracerName)
+}
+
+// extractWorkflowContext retrieves the unexported context from a traceloop.Workflow.
+func extractWorkflowContext(w *traceloop.Workflow) context.Context {
+	if w == nil {
+		return nil
+	}
+	defer func() {
+		_ = recover()
+	}()
+
+	val := reflect.ValueOf(w).Elem()
+	field := val.FieldByName("ctx")
+	if !field.IsValid() {
+		return nil
+	}
+
+	realField := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+	return realField.Interface().(context.Context)
+}
+
+// extractTaskContext retrieves the unexported context from a traceloop.Task.
+func extractTaskContext(t *traceloop.Task) context.Context {
+	if t == nil {
+		return nil
+	}
+	defer func() {
+		_ = recover()
+	}()
+
+	val := reflect.ValueOf(t).Elem()
+	field := val.FieldByName("ctx")
+	if !field.IsValid() {
+		return nil
+	}
+
+	realField := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+	return realField.Interface().(context.Context)
 }

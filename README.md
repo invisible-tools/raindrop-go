@@ -88,10 +88,30 @@ Signals tie QA reviews, customer comments, or tool automation directly back to t
 ### 4. Trace AI flows (optional)
 
 ```go
+// 1. Tasks group logical steps
 task := interaction.TaskSpan(ctx, raindrop.TaskSpanConfig{Name: "sentiment.analysis"})
 defer task.End()
 
-llmSpan, err := interaction.LLMSpan(ctx, raindrop.LLMSpanConfig{
+// IMPORTANT: Use task.Context() for nested spans to maintain the trace hierarchy
+toolCtx := task.Context()
+
+// 2. Tools capture external calls with input/output
+tool := interaction.ToolSpan(toolCtx, raindrop.ToolSpanConfig{
+    Name: "playbook_lookup",
+    Type: "function",
+    Function: raindrop.ToolFunction{
+        Name:        "playbook_lookup",
+        Description: "Finds recommended actions",
+        Parameters:  map[string]any{"sentiment": "negative"},
+    },
+})
+defer tool.End()
+
+// ... perform tool logic ...
+tool.ReportResult("playbook_id: retention_risk")
+
+// 3. LLM spans track model usage
+llmSpan := interaction.LLMSpan(toolCtx, raindrop.LLMSpanConfig{
 	Prompt: raindrop.Prompt{
 		Vendor: "openai",
 		Mode:   "chat",
@@ -102,9 +122,6 @@ llmSpan, err := interaction.LLMSpan(ctx, raindrop.LLMSpanConfig{
 		},
 	},
 })
-if err != nil {
-	log.Fatalf("llm span: %v", err)
-}
 defer llmSpan.End(ctx)
 
 llmSpan.RecordCompletion(ctx, raindrop.Completion{

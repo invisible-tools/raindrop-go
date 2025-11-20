@@ -100,10 +100,7 @@ func TestInteractionLLMSpanDefaults(t *testing.T) {
 		},
 	}
 
-	span, err := interaction.LLMSpan(context.Background(), LLMSpanConfig{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	span := interaction.LLMSpan(context.Background(), LLMSpanConfig{})
 	if span == nil {
 		t.Fatalf("expected span even when tracer disabled")
 	}

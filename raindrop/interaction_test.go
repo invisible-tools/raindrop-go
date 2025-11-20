@@ -12,12 +12,12 @@ func TestInteractionMutators(t *testing.T) {
 		ctx:    context.Background(),
 		cancel: func() {},
 	}
-	interaction := newInteraction(client, &trackRequest{
+	ctx := context.Background()
+	interaction := newInteraction(ctx, client, &trackRequest{
 		EventID:    "evt-123",
 		Properties: Props{},
 	}, time.Hour)
 
-	ctx := context.Background()
 	if err := interaction.SetProperty(ctx, "stage", "processing"); err != nil {
 		t.Fatalf("SetProperty error: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestInteractionTrackSignalInjectsEventID(t *testing.T) {
 		ctx:    context.Background(),
 		cancel: func() {},
 	}
-	interaction := newInteraction(client, &trackRequest{
+	interaction := newInteraction(context.Background(), client, &trackRequest{
 		EventID: "evt-999",
 	}, time.Hour)
 

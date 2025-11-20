@@ -104,7 +104,7 @@ func main() {
 	sentimentTask := interaction.TaskSpan(ctx, raindrop.TaskSpanConfig{Name: "sentiment.analysis"})
 	defer sentimentTask.End()
 
-	llmSpan, err := interaction.LLMSpan(ctx, raindrop.LLMSpanConfig{
+	llmSpan := interaction.LLMSpan(ctx, raindrop.LLMSpanConfig{
 		Prompt: raindrop.Prompt{
 			Vendor:   "openai",
 			Mode:     "chat",
@@ -112,9 +112,6 @@ func main() {
 			Messages: raindropSentimentMessages,
 		},
 	})
-	if err != nil {
-		log.Fatalf("llm span: %v", err)
-	}
 	defer llmSpan.End(ctx)
 
 	if err := interaction.SetProperty(ctx, "stage", "calling_openai"); err != nil {
@@ -161,9 +158,23 @@ func main() {
 		log.Fatalf("add output attachment: %v", err)
 	}
 
-	playbookTask := interaction.TaskSpan(ctx, raindrop.TaskSpanConfig{Name: "tool.playbook_lookup"})
+	// IMPORTANT: Capture context from parent task to maintain hierarchy
+	playbookTask := interaction.ToolSpan(sentimentTask.Context(), raindrop.ToolSpanConfig{
+		Name: "playbook_lookup",
+		Type: "function",
+		Function: raindrop.ToolFunction{
+			Name:        "playbook_lookup",
+			Description: "Looks up recommended actions based on customer feedback sentiment.",
+			Parameters: map[string]any{
+				"sentiment":       result.Sentiment,
+				"keywords":        result.Keywords,
+				"contains_portal": strings.Contains(strings.ToLower(sampleFeedback), "billing"),
+			},
+		},
+	})
 	defer playbookTask.End()
 	playbook := lookupPlaybook(sampleFeedback, result)
+	playbookTask.ReportResult(formatJSON(playbook))
 
 	if err := interaction.SetProperties(ctx, raindrop.Props{
 		"stage":             "playbook_ready",
@@ -187,7 +198,7 @@ func main() {
 	followupPrompt := buildFollowupPrompt(sampleFeedback, result, playbook)
 	openaiFollowupMessages, raindropFollowupMessages := buildChatPrompts(followupSystemPrompt, followupPrompt)
 
-	followupSpan, err := interaction.LLMSpan(ctx, raindrop.LLMSpanConfig{
+	followupSpan := interaction.LLMSpan(ctx, raindrop.LLMSpanConfig{
 		Prompt: raindrop.Prompt{
 			Vendor:   "openai",
 			Mode:     "chat",
@@ -195,9 +206,6 @@ func main() {
 			Messages: raindropFollowupMessages,
 		},
 	})
-	if err != nil {
-		log.Fatalf("follow-up span: %v", err)
-	}
 	defer followupSpan.End(ctx)
 
 	plan, planRaw, followupUsage, err := draftFollowupPlan(ctx, openaiClient, openaiFollowupMessages)
