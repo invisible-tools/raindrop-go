@@ -14,6 +14,7 @@ import (
 	semconvai "github.com/traceloop/go-openllmetry/semconv-ai"
 	traceloop "github.com/traceloop/go-openllmetry/traceloop-sdk"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -104,9 +105,15 @@ func (t *Tracer) LogPrompt(ctx context.Context, prompt Prompt, cfg WorkflowSpanC
 		return newNoopLLMSpan(ctx)
 	}
 	// We need to adapt to v0.1.3 changes.
+	mergedAssoc := mergeAssoc(t.associationProps, cfg.AssociationProperties)
+	if mergedAssoc == nil {
+		mergedAssoc = make(map[string]string)
+	}
+	// Set task_name association property for LLM spans
+	mergedAssoc["task_name"] = "llm"
 	ctxAttrs := traceloop.ContextAttributes{
 		WorkflowName:          &cfg.Name,
-		AssociationProperties: mergeAssoc(t.associationProps, cfg.AssociationProperties),
+		AssociationProperties: mergedAssoc,
 	}
 
 	span := t.client.LogPrompt(ctx, prompt, ctxAttrs)
@@ -156,10 +163,25 @@ func (w *WorkflowSpan) Context() context.Context {
 }
 
 func (w *WorkflowSpan) LLMSpan(prompt Prompt) *LLMSpan {
-	if w == nil || w.disabled || w.workflow == nil {
+	if w == nil || w.disabled || w.workflow == nil || w.tracer == nil || w.tracer.client == nil {
 		return newNoopLLMSpan(w.Context())
 	}
-	span := w.workflow.LogPrompt(prompt)
+
+	// Use tracer's LogPrompt to pass association properties
+	assoc := make(map[string]string)
+	for k, v := range w.workflow.Attributes.AssociationProperties {
+		assoc[k] = v
+	}
+	// Set task_name association property for LLM spans
+	assoc["task_name"] = "llm"
+
+	wfName := w.workflow.Attributes.Name
+	ctxAttrs := traceloop.ContextAttributes{
+		WorkflowName:          &wfName,
+		AssociationProperties: assoc,
+	}
+
+	span := w.tracer.client.LogPrompt(w.Context(), prompt, ctxAttrs)
 	return newLLMSpan(span, w.Context())
 }
 
@@ -179,8 +201,9 @@ func (w *WorkflowSpan) NewTask(cfg TaskSpanConfig) *TaskSpan {
 	}
 
 	return &TaskSpan{
-		task: task,
-		ctx:  taskCtx,
+		tracer: w.tracer,
+		task:   task,
+		ctx:    taskCtx,
 	}
 }
 
@@ -220,6 +243,9 @@ func (w *WorkflowSpan) NewTool(cfg ToolSpanConfig) *ToolSpan {
 		attrs = append(attrs, attribute.String("traceloop.association.properties."+k, v))
 	}
 
+	// Set task_name association property for tool spans
+	attrs = append(attrs, attribute.String("traceloop.association.properties.task_name", "tool"))
+
 	span.SetAttributes(attrs...)
 
 	return &ToolSpan{
@@ -231,6 +257,7 @@ func (w *WorkflowSpan) NewTool(cfg ToolSpanConfig) *ToolSpan {
 }
 
 type TaskSpan struct {
+	tracer   *Tracer
 	task     *traceloop.Task
 	ctx      context.Context
 	disabled bool
@@ -255,10 +282,24 @@ func (t *TaskSpan) Context() context.Context {
 }
 
 func (t *TaskSpan) LLMSpan(prompt Prompt) *LLMSpan {
-	if t == nil || t.disabled || t.task == nil {
+	if t == nil || t.disabled || t.task == nil || t.tracer == nil || t.tracer.client == nil {
 		return newNoopLLMSpan(t.Context())
 	}
-	span := t.task.LogPrompt(prompt)
+
+	// Use tracer's LogPrompt to pass association properties
+	// We need to get workflow name from the task's parent workflow
+	// For now, we'll use an empty workflow name since task doesn't expose workflow directly
+	assoc := make(map[string]string)
+	// Set task_name association property for LLM spans
+	assoc["task_name"] = "llm"
+
+	var wfName string
+	ctxAttrs := traceloop.ContextAttributes{
+		WorkflowName:          &wfName,
+		AssociationProperties: assoc,
+	}
+
+	span := t.tracer.client.LogPrompt(t.Context(), prompt, ctxAttrs)
 	return newLLMSpan(span, t.Context())
 }
 
@@ -292,6 +333,19 @@ func (t *ToolSpan) ReportResult(result string) {
 	}
 }
 
+// ReportError records an error that occurred during tool execution.
+// It records the error on the span and sets the span status to error.
+func (t *ToolSpan) ReportError(err error) {
+	if t == nil || t.disabled || t.ctx == nil || err == nil {
+		return
+	}
+	span := trace.SpanFromContext(t.ctx)
+	if span.IsRecording() {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+}
+
 func (t *ToolSpan) Context() context.Context {
 	if t == nil || t.ctx == nil {
 		return context.Background()
@@ -315,6 +369,8 @@ func (t *ToolSpan) LLMSpan(prompt Prompt) *LLMSpan {
 	for k, v := range t.properties {
 		assoc[k] = v
 	}
+	// Set task_name association property for LLM spans
+	assoc["task_name"] = "llm"
 
 	wfName := ""
 	if t.workflow != nil {
@@ -379,6 +435,19 @@ func (l *LLMSpan) RecordCompletion(ctx context.Context, completion Completion, u
 
 func (l *LLMSpan) End(ctx context.Context) error {
 	return l.RecordCompletion(ctx, Completion{}, Usage{})
+}
+
+// ReportError records an error that occurred during LLM invocation.
+// It records the error on the span and sets the span status to error.
+func (l *LLMSpan) ReportError(err error) {
+	if l == nil || l.disabled || l.ctx == nil || err == nil {
+		return
+	}
+	span := trace.SpanFromContext(l.ctx)
+	if span.IsRecording() {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 }
 
 func mergeAssoc(global map[string]string, local map[string]string) map[string]string {

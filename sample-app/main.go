@@ -195,6 +195,28 @@ func main() {
 		log.Fatalf("add playbook attachment: %v", err)
 	}
 
+	// Example: Failed tool call span
+	customerHistoryTask := interaction.ToolSpan(sentimentTask.Context(), raindrop.ToolSpanConfig{
+		Name: "customer_history_lookup",
+		Type: "function",
+		Function: raindrop.ToolFunction{
+			Name:        "customer_history_lookup",
+			Description: "Retrieves customer interaction history from CRM system",
+			Parameters: map[string]any{
+				"user_id": "user-123",
+				"limit":   10,
+			},
+		},
+	})
+	defer customerHistoryTask.End()
+
+	// Simulate a failed API call
+	if err := simulateFailedCustomerHistoryLookup(); err != nil {
+		log.Printf("customer history lookup failed: %v", err)
+		customerHistoryTask.ReportError(err)
+		// Continue execution despite the error
+	}
+
 	followupPrompt := buildFollowupPrompt(sampleFeedback, result, playbook)
 	openaiFollowupMessages, raindropFollowupMessages := buildChatPrompts(followupSystemPrompt, followupPrompt)
 
@@ -350,6 +372,11 @@ func lookupPlaybook(feedback string, sentiment SentimentResult) PlaybookRecommen
 		ConfidenceLevel:   confidence,
 		KnowledgeBaseLink: fmt.Sprintf("https://example.com/playbooks/%s", segment),
 	}
+}
+
+func simulateFailedCustomerHistoryLookup() error {
+	// Simulate a timeout or connection error from an external CRM API
+	return fmt.Errorf("CRM API timeout: connection to customer-history-service failed after 5s")
 }
 
 func buildFollowupPrompt(feedback string, sentiment SentimentResult, playbook PlaybookRecommendation) string {
